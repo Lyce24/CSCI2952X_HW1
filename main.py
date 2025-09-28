@@ -1,6 +1,7 @@
 import argparse
 import yaml
 import torch
+import time
 
 from utils.utils import set_seed
 from data.data import get_ssl_dataloader, get_lp_dataloaders
@@ -63,12 +64,14 @@ def lp(config):
 
     # Device selection with safe fallback
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+    print("Using device:", device)
+    
     # Data
     train_loader, val_loader, test_loader = get_lp_dataloaders(
         batch_size=config["lp_batch_size"],
         workers=config["workers"],
     )
+    print(f"Number of training samples: {len(train_loader.dataset)}")
 
     # Backbone + classifier
     backbone = construct_backbone(
@@ -80,6 +83,7 @@ def lp(config):
         device=device,
     )
     model = Classifier(backbone=backbone, num_classes=10)
+    print("=> creating model '{}'".format(config['arch']))
 
     # out_dir
     # arch + ssl_batch_size + ssl_lr + ssl_wd + lp_batch_size + lp_lr + lp_wd
@@ -91,26 +95,30 @@ def lp(config):
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
-        lr=config["lp_lr"],
-        wd=config["lp_wd"],
+        lr=float(config["lp_lr"]),
+        wd=float(config["lp_wd"]),
         device=device,
         out_dir=out_dir,
         use_amp=True,
-        print_freq=config["lp_print_freq"],
+        print_freq=int(config["lp_print_freq"]),
     )
 
     # Test using best checkpoint saved by training
     best_model_path = f'{out_dir}/best.ckpt'
-    test(model, test_loader, device, ckpt_path=best_model_path)
+    test(model, test_loader, device, ckpt_path=best_model_path, out_dir=out_dir)
 
 def main(config):
     print("Starting SSL phase...")
+    start_time = time.perf_counter()
     ssl(config)
-    print("SSL phase completed.\n")
+    end_time = time.perf_counter()
+    print(f"SSL phase completed in {end_time - start_time:.2f} seconds.\n")
 
     print("Starting Linear Probing phase...")
+    start_time = time.perf_counter()
     lp(config)
-    print("Linear Probing phase completed.")
+    end_time = time.perf_counter()
+    print(f"Linear Probing phase completed in {end_time - start_time:.2f} seconds.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

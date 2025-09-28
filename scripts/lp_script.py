@@ -124,22 +124,25 @@ def train_classifier(epochs,
             "loss",
             "acc",
             "time_sec",
-            "ckpt"           # best / last / ''
         ],
     )
 
     best_val_acc = -1.0
     best_path = out / "best.ckpt"
     last_path = out / "last.ckpt"
+    
+    best_epoch = -1
+    last_epoch = -1
 
     for epoch in range(1, epochs + 1):
         t0 = time.time()
         train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device, scaler)
+        t1 = time.time()
         val_loss, val_acc = validate(model, val_loader, criterion, device)
+        t2 = time.time()
         scheduler.step()
 
         lr_now = optimizer.param_groups[0]["lr"]
-        dt = time.time() - t0
 
         # Log
         if epoch % print_freq == 0 or epoch == 1 or epoch == epochs:
@@ -148,7 +151,7 @@ def train_classifier(epochs,
                     f"train_loss {train_loss:.4f} | "
                     f"val_loss {val_loss:.4f} | "
                     f"val_acc {val_acc*100:.2f}% | "
-                    f"{dt:.1f}s")
+                    f"{t1 - t0:.1f}s/{t2 - t1:.1f}s (train/val)")
             
             # ---- CSV: train epoch summary ----
             logger.log({
@@ -158,8 +161,7 @@ def train_classifier(epochs,
                 "lr": f"{lr_now:.8f}",
                 "loss": f"{train_loss:.6f}",
                 "acc": "",
-                "time_sec": f"{dt:.3f}",
-                "ckpt": ""
+                "time_sec": f"{t1 - t0:.3f}",
             })
 
             # ---- CSV: val epoch summary ----
@@ -170,8 +172,7 @@ def train_classifier(epochs,
                 "lr": f"{lr_now:.8f}",
                 "loss": f"{val_loss:.6f}",
                 "acc": f"{val_acc:.6f}",
-                "time_sec": "",
-                "ckpt": ""
+                "time_sec": f"{t2 - t1:.3f}",
             })
 
         # ---- checkpoint: last ----
@@ -188,25 +189,36 @@ def train_classifier(epochs,
         # mark which ckpt we wrote
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            ckpt_mark = "best"
+            best_epoch = epoch
         else:
-            ckpt_mark = "last"
+            last_epoch = epoch
 
-        # ---- CSV: checkpoint marker ----
-        logger.log({
-            "phase": "checkpoint",
-            "epoch": epoch,
-            "iter": "",
-            "lr": "",
-            "loss": "",
-            "acc": "",
-            "time_sec": "",
-            "ckpt": ckpt_mark
-        })
+    # ---- CSV: checkpoint marker ----
+    logger.log({
+        "phase": "checkpoint",
+        "epoch": best_epoch,
+        "iter": "",
+        "lr": "",
+        "loss": "",
+        "acc": "",
+        "time_sec": "",
+        "ckpt": "best",
+    })
+    
+    logger.log({
+        "phase": "checkpoint",
+        "epoch": last_epoch,
+        "iter": "",
+        "lr": "",
+        "loss": "",
+        "acc": "",
+        "time_sec": "",
+        "ckpt": "last",
+    })
 
     print(f"Done. Best val_acc: {best_val_acc*100:.2f}% | saved -> {best_path}")
     
-def test(model, test_loader, device, ckpt_path):
+def test(model, test_loader, device, ckpt_path, out_dir=None):
     ckpt = torch.load(ckpt_path, map_location="cpu")
     model.load_state_dict(ckpt["model"])
     model.to(device)
@@ -215,3 +227,10 @@ def test(model, test_loader, device, ckpt_path):
 
     test_loss, test_acc = validate(model, test_loader, criterion, device)
     print(f"Test Loss: {test_loss:.4f} | Test Acc: {test_acc*100:.2f}%")
+    if out_dir is not None:
+        out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
+        log_path = out / "test_log.txt"
+        with open(log_path, "w") as f:
+            f.write(f"Test Loss: {test_loss:.4f}\n")
+            f.write(f"Test Acc: {test_acc*100:.2f}%\n")
+        print(f"Test results saved to {log_path}")

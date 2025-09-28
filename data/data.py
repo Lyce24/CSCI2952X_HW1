@@ -95,12 +95,21 @@ twocrops = TwoCropsTransform(
 
 ssl_train_dataset = ssl_ds["train"].with_transform(apply_ssl_transforms)
 # For SSL, there is no validation set since we do not use labels
+ssl_test_dataset = ssl_ds["test"].with_transform(apply_lp_transforms) # use lp transforms for visualization
 
 def get_ssl_dataloader(batch_size, workers):
     return torch.utils.data.DataLoader(
         ssl_train_dataset, batch_size=batch_size, shuffle=True,
         num_workers=workers, pin_memory=True, drop_last=True,
         collate_fn=collate_moco
+    )
+    
+def get_ssl_test_dataloader(batch_size, workers):
+    return torch.utils.data.DataLoader(
+        ssl_test_dataset,
+        batch_size=batch_size, shuffle=False,
+        num_workers=workers, pin_memory=True, drop_last=False,
+        collate_fn=collate_fn
     )
 
 ############################ For linear probe ##########################

@@ -142,7 +142,8 @@ def train_moco(
     elif optimizer == 'adamw':
         optimizer = optim.AdamW(model.parameters(), lr,
                                 weight_decay=wd)
-
+    
+    os.makedirs(ckpt_dir, exist_ok=True)
     log_path = os.path.join(ckpt_dir, "train_log.csv")
     logger = CSVLogger(
         log_path,
@@ -172,7 +173,6 @@ def train_moco(
         )
 
         # save per save_freq epochs
-        os.makedirs(ckpt_dir, exist_ok=True)
         if (epoch + 1) % save_freq == 0 or (epoch + 1) == epochs:
             save_checkpoint({
                 'state_dict': model.state_dict(),
