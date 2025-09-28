@@ -3,6 +3,8 @@ import math
 import random
 import torchvision.transforms.functional as tf
 import torch
+import csv
+from pathlib import Path
 
 def set_seed(seed: int = 42, deterministic: bool = True, benchmark: bool = False):
     random.seed(seed)
@@ -74,3 +76,24 @@ class LARS(torch.optim.Optimizer):
                 mu = param_state['mu']
                 mu.mul_(g['momentum']).add_(dp)
                 p.add_(mu, alpha=-g['lr'])
+
+class CSVLogger:
+    def __init__(self, filepath: str, fieldnames: list[str]):
+        self.filepath = Path(filepath)
+        self.filepath.parent.mkdir(parents=True, exist_ok=True)
+        self.fieldnames = fieldnames
+        self._init_file()
+
+    def _init_file(self):
+        new_file = not self.filepath.exists()
+        with self.filepath.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+            if new_file:
+                writer.writeheader()
+
+    def log(self, row: dict):
+        # keep only known fields; missing fields default to ''
+        clean = {k: row.get(k, "") for k in self.fieldnames}
+        with self.filepath.open("a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+            writer.writerow(clean)

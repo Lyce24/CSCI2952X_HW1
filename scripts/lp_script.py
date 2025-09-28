@@ -1,14 +1,13 @@
 import torch
-import os, csv, time, math, random
 from pathlib import Path
+import time
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from data.data import get_lp_dataloaders
-from utils.utils import set_seed
-from models.models import MoCo, Classifier
+from utils.utils import CSVLogger
+from models.models import MoCo
 
 def construct_backbone(arch: str, ckpt_path: str = None, moco_t: float = 0.2, moco_dim: int = 256, moco_mlp_dim: int = 4096, device: torch.device = torch.device("cpu")) -> nn.Module:
     """Construct backbone from a pre-trained MoCo model or a standard model from timm. 
@@ -115,10 +114,19 @@ def train_classifier(epochs,
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     
     # Metrics log
-    metrics_csv = out / "metrics.csv"
-    with metrics_csv.open("w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["epoch", "lr", "train_loss", "val_loss", "val_acc"])
+    log_path = out / "train_log.csv"
+    logger = CSVLogger(
+        str(log_path),
+        fieldnames=[
+            "phase",         # train_epoch | val_epoch | checkpoint
+            "epoch",
+            "lr",
+            "loss",
+            "acc",
+            "time_sec",
+            "ckpt"           # best / last / ''
+        ],
+    )
 
     best_val_acc = -1.0
     best_path = out / "best.ckpt"
@@ -141,24 +149,60 @@ def train_classifier(epochs,
                     f"val_loss {val_loss:.4f} | "
                     f"val_acc {val_acc*100:.2f}% | "
                     f"{dt:.1f}s")
+            
+            # ---- CSV: train epoch summary ----
+            logger.log({
+                "phase": "train_epoch",
+                "epoch": epoch,
+                "iter": "",
+                "lr": f"{lr_now:.8f}",
+                "loss": f"{train_loss:.6f}",
+                "acc": "",
+                "time_sec": f"{dt:.3f}",
+                "ckpt": ""
+            })
 
-        with metrics_csv.open("a", newline="") as f:
-            csv.writer(f).writerow([epoch, lr_now, train_loss, val_loss, val_acc])
+            # ---- CSV: val epoch summary ----
+            logger.log({
+                "phase": "val_epoch",
+                "epoch": epoch,
+                "iter": "",
+                "lr": f"{lr_now:.8f}",
+                "loss": f"{val_loss:.6f}",
+                "acc": f"{val_acc:.6f}",
+                "time_sec": "",
+                "ckpt": ""
+            })
 
-        # Checkpointing
-        torch.save({"epoch": epoch,
-                    "model": model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "scaler": scaler.state_dict() if scaler else None},
-                   last_path)
+        # ---- checkpoint: last ----
+        torch.save(
+            {
+                "epoch": epoch,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scaler": scaler.state_dict() if scaler is not None else None,
+            },
+            best_path if val_acc > best_val_acc else last_path,
+        )
 
+        # mark which ckpt we wrote
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            torch.save({"epoch": epoch,
-                        "model": model.state_dict(),
-                        "optimizer": optimizer.state_dict(),
-                        "scaler": scaler.state_dict() if scaler else None},
-                       best_path)
+            ckpt_mark = "best"
+        else:
+            ckpt_mark = "last"
+
+        # ---- CSV: checkpoint marker ----
+        logger.log({
+            "phase": "checkpoint",
+            "epoch": epoch,
+            "iter": "",
+            "lr": "",
+            "loss": "",
+            "acc": "",
+            "time_sec": "",
+            "ckpt": ckpt_mark
+        })
 
     print(f"Done. Best val_acc: {best_val_acc*100:.2f}% | saved -> {best_path}")
     
