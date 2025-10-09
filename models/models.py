@@ -6,10 +6,72 @@ import torch.nn as nn
 import torch.nn.functional as F
 import timm
 
+import math, torch, torch.nn as nn
+
+@torch.no_grad()
+def build_2d_sincos_pos_embed(grid_size, embed_dim, temperature=10000.):
+    h, w = grid_size
+    grid_w = torch.arange(w, dtype=torch.float32)
+    grid_h = torch.arange(h, dtype=torch.float32)
+    grid_w, grid_h = torch.meshgrid(grid_w, grid_h, indexing='xy')  # PyTorch >= 1.10
+
+    assert embed_dim % 4 == 0
+    pos_dim = embed_dim // 4
+    omega = torch.arange(pos_dim, dtype=torch.float32) / pos_dim
+    omega = 1. / (temperature ** omega)
+
+    out_w = torch.einsum('m,d->md', grid_w.flatten(), omega)
+    out_h = torch.einsum('m,d->md', grid_h.flatten(), omega)
+
+    pe = torch.cat([torch.sin(out_w), torch.cos(out_w), torch.sin(out_h), torch.cos(out_h)], dim=1)
+    pe = pe[None, :, :]  # [1, H*W, C]
+    return pe  # no cls token included
+
+@torch.no_grad()
+def moco_vit_init(model: nn.Module):
+    # 1) fixed 2D sin-cos pos-embed (freeze)
+    # timm ViT: model.pos_embed is [1, 1+N, C], model.patch_embed.grid_size is (H, W)
+    H, W = model.patch_embed.grid_size
+    C = model.pos_embed.shape[-1]
+    pe = build_2d_sincos_pos_embed((H, W), C)
+    pe_token = torch.zeros(1, 1, C, dtype=torch.float32)
+    pe_full = torch.cat([pe_token, pe], dim=1)  # [1, 1+N, C]
+    with torch.no_grad():
+        model.pos_embed.copy_(pe_full)
+    model.pos_embed.requires_grad_(False)
+
+    # 2) CLS token tiny init
+    nn.init.normal_(model.cls_token, std=1e-6)
+
+    # 3) qkv + linear init like MoCo v3
+    for name, m in model.named_modules():
+        if isinstance(m, nn.Linear):
+            if 'attn.qkv' in name or name.endswith('qkv'):
+                out, in_ = m.weight.shape  # out = 3*embed_dim, in_ = embed_dim
+                val = math.sqrt(6. / float(out // 3 + in_))
+                nn.init.uniform_(m.weight, -val, val)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            else:
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    # 4) patch embed proj init + optional freeze first "conv"
+    proj = getattr(model.patch_embed, 'proj', None)
+    if isinstance(proj, nn.Conv2d):
+        # fan-aware uniform per MoCo code: sqrt(6 / (3*patch^2 + embed_dim))
+        patch = proj.kernel_size[0]
+        embed_dim = model.embed_dim
+        val = math.sqrt(6. / float(3 * (patch * patch) + embed_dim))
+        nn.init.uniform_(proj.weight, -val, val)
+        if proj.bias is not None:
+            nn.init.zeros_(proj.bias)
+
 # -------------------------
 # Encoder factory (no pretrained weights)
 # -------------------------
-def build_encoder(arch: str):
+def build_encoder(arch: str, moco_style: bool = True):
     """
     Returns (model, is_vit).
     - torchvision ResNets: 'resnet18', 'resnet34', 'resnet50', 'resnet101', ...
@@ -30,8 +92,10 @@ def build_encoder(arch: str):
     if arch in timm.list_models():
         # num_classes=0 => remove classifier; forward returns features
         model = timm.create_model(arch, pretrained=False, num_classes=0)
-        # Heuristic: ViTs in timm have .patch_embed and .blocks
         is_vit = hasattr(model, "patch_embed") and hasattr(model, "blocks") and ("vit" in arch)
+        # Heuristic: ViTs in timm have .patch_embed and .blocks
+        if is_vit:
+            moco_vit_init(model) if moco_style else None
         return model, is_vit
 
 def model_feature_dim(model) -> int:
@@ -39,15 +103,6 @@ def model_feature_dim(model) -> int:
     # timm models expose num_features reliably
     if hasattr(model, "num_features"):
         return int(model.num_features)
-
-    # torchvision ResNet after replacing fc with Identity -> in_features is lost,
-    # so we infer by a quick forward on a dummy input (safe + cheap).
-    # Use a small 224x224 RGB; adjust if your input size differs.
-    with torch.no_grad():
-        model.eval()
-        x = torch.zeros(1, 3, 224, 224)
-        y = model(x)
-        return int(y.shape[-1])
 
 class MoCo(nn.Module):
     """
@@ -66,6 +121,7 @@ class MoCo(nn.Module):
         T: float = 0.2,
         proj_layers: int = 3,     # 2 for ResNet-like, 3 sometimes used for ViT
         pred_layers: int = 2,
+        moco_style: bool = True
     ):
         """
         encoder_name: string name for the base encoder
@@ -79,8 +135,8 @@ class MoCo(nn.Module):
         self.T = T
 
         # Build encoders (no pretrained weights)
-        q_enc, is_vit_q = build_encoder(encoder_name)
-        k_enc, is_vit_k = build_encoder(encoder_name)
+        q_enc, is_vit_q = build_encoder(encoder_name, moco_style=moco_style)
+        k_enc, is_vit_k = build_encoder(encoder_name, moco_style=moco_style)
         assert is_vit_q == is_vit_k, "Query and key encoder types must match"
 
         self.base_encoder = q_enc
@@ -180,10 +236,21 @@ class MoCo(nn.Module):
 
         return self.contrastive_loss(q1, k2) + self.contrastive_loss(q2, k1)
 
+
 class Classifier(nn.Module):
-    def __init__(self, backbone, num_classes=10):
+    def __init__(self, backbone, num_classes=10, requires_grad=False, eval_mode=True, moco_style: bool = False):
         super(Classifier, self).__init__()
         self.backbone = backbone
+        
+        for p in self.backbone.parameters():
+            p.requires_grad = requires_grad
+
+        if moco_style:
+            self.backbone.pos_embed.requires_grad_(False)
+        
+        if eval_mode:
+            self.backbone.eval()
+        
         self.fc = nn.Linear(backbone.num_features, num_classes)
 
     def forward(self, x):
@@ -193,14 +260,13 @@ class Classifier(nn.Module):
 
 if __name__ == "__main__":
     import time
-    for i in ["resnet18", "resnet34", "resnet50", "resnet101", "vit_s", "vit_b"]:
+    for i in ["resnet18", "vit_s", "vit_b"]:
         m, is_vit = build_encoder(i)
         print(f"{i}: is_vit={is_vit}, feature_dim={model_feature_dim(m)}")
-    
-    moco = MoCo(encoder_name="vit_b")
-    x = torch.randn(256, 3, 224, 224)
-    start_time = time.time()
-    loss = moco(x, x, m=0.99)
-    end_time = time.time()
-    print("Loss:", loss.item())
-    print("Forward pass time:", end_time - start_time)
+        moco = MoCo(encoder_name=i, moco_style=True)
+        x = torch.randn(256, 3, 224, 224)
+        start_time = time.time()
+        loss = moco(x, x, m=0.99)
+        end_time = time.time()
+        print("Loss:", loss.item())
+        print("Forward pass time:", end_time - start_time)
