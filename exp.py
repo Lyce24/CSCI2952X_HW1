@@ -264,14 +264,10 @@ if __name__ == "__main__":
     
     EXP_PAIRS = [
         # LR, WD, DA method, Normalization, random flips, random rotations, crop_min
-        (3e-4, 0.05, "GA",   "GAFG", True, True, 0.2),
-        (3e-4, 0.05, "GA",   "IN", True, True, 0.2),   # GA + IN
-        (3e-4, 0.05, "BYOL", "IN", True, True, 0.2),   # BYOL + IN
-        (3e-4, 0.05, "GA",   "GAFG", True, True, 0.4),
-        (3e-4, 0.05, "GA",   "IN", True, True, 0.4),   # GA + IN
-        (3e-4, 0.05, "BYOL", "IN", True, True, 0.4),
-        (3e-4, 0.05, "GA",   "GAFG", True, True, 0.6),
-        (3e-4, 0.05, "GA",   "IN", True, True, 0.6),   # GA + IN
+        (3e-4, 0.05, "GA",   "IN", True, True, 0.1),   # GA + IN
+        (3e-4, 0.05, "BYOL", "IN", True, True, 0.1),   # BYOL + IN
+        (5e-4, 0.05, "GA",   "IN", True, True, 0.2),   # GA + IN
+        (7e-4, 0.05, "GA",   "IN", True, True, 0.2),   # GA + IN
     ]
 
     INVARIANTS_CONFIG = {
