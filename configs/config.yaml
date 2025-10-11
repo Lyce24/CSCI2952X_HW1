@@ -15,8 +15,8 @@ ssl_optimizer: adamw
 ssl_lr: 5e-4
 ssl_wd: 0.05
 ssl_momentum: 0.9 # not used for adamw
-ssl_epochs: 5
-ssl_warmup_epochs: 0
+ssl_epochs: 300
+ssl_warmup_epochs: 20
 ssl_da_method: GA # BYOL or GA (Galaxy-Aware)
 ssl_normalization: IN # IN; GA; GAFG
 ssl_flips: true
@@ -25,13 +25,13 @@ ssl_artifacts: true
 ssl_noise: true
 ssl_crop_min: 0.2
 ssl_print_freq: 20
-ssl_save_freq: 5
+ssl_save_freq: 50
 
 # For linear probing
 lp_batch_size: 256
 lp_optimizer: adamw
-lp_epochs: 5
+lp_epochs: 100
 lp_lr: 3e-3
 lp_wd: 0.05
 lp_label_smoothing: 0.05
-lp_print_freq: 5
+lp_print_freq: 10

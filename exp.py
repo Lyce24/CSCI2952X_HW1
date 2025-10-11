@@ -238,8 +238,8 @@ def run_multi_seed(base_config: dict, seeds: list[int], logger: CSVLogger = None
     return per_seed, summary
 
 def main(base_config: dict, exp_pairs: list[tuple], seeds: list[int] = [2952]):
-    results_csv = "results/ssl_lp_sweep_ab.csv"
-    summary_csv = "results/ssl_lp_summary_ab.csv"
+    results_csv = "results/exp/ssl_lp_sweep.csv"
+    summary_csv = "results/exp/ssl_lp_summary.csv"
     Path("results").mkdir(parents=True, exist_ok=True)
 
     # per-seed rows
