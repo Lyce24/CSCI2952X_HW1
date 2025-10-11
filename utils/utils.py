@@ -8,20 +8,16 @@ import tempfile
 import random
 import numpy as np
 from pathlib import Path
-from torch.amp import GradScaler
-import torch.nn as nn
 import shutil
-from torchvision import transforms
 
-def set_seed(seed: int = 42, deterministic: bool = False, benchmark: bool = True):
+def set_seed(seed: int = 42, deterministic: bool = True, benchmark: bool = False):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    # Fast preset (allows small drift)
-    torch.backends.cudnn.deterministic = deterministic   # False for speed
-    torch.backends.cudnn.benchmark = benchmark           # True for autotuned fast kernels
+    torch.backends.cudnn.deterministic = deterministic
+    torch.backends.cudnn.benchmark = benchmark
 
 class GaussianBlur(object):
     """Gaussian blur augmentation from SimCLR: https://arxiv.org/abs/2002.05709"""
@@ -187,74 +183,3 @@ def save_checkpoint(state: dict, is_best: bool, filename='checkpoint.pth.tar'):
     if is_best:
         best_path = Path(filename).with_name('model_best.pth.tar')
         shutil.copyfile(filename, best_path)
-
-def load_checkpoint_if_any(
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer | None,
-    scaler: GradScaler | None,
-    resume_path: str | None,
-    device: torch.device
-):
-    """
-    Returns (start_epoch, global_step). If resume_path is None or missing keys, continues gracefully.
-    """
-    start_epoch, global_step = 0, 0
-    if not resume_path:
-        return start_epoch, global_step
-
-    ckpt_path = Path(resume_path)
-    if not ckpt_path.is_file():
-        print(f"[resume] No checkpoint found at {resume_path}")
-        return start_epoch, global_step
-
-    print(f"[resume] Loading checkpoint: {resume_path}")
-    checkpoint = torch.load(str(ckpt_path), map_location=device, weights_only=False)
-
-    # model
-    if "state_dict" in checkpoint:
-        missing, unexpected = model.load_state_dict(checkpoint["state_dict"], strict=False)
-        if missing or unexpected:
-            print(f"[resume] model missing keys: {missing}\n[resume] unexpected keys: {unexpected}")
-
-    # optimizer
-    if optimizer is not None and "optimizer" in checkpoint:
-        try:
-            optimizer.load_state_dict(checkpoint["optimizer"])
-        except Exception as e:
-            print(f"[resume] optimizer state load failed: {e}")
-
-    # scaler
-    if scaler is not None and "scaler" in checkpoint:
-        try:
-            scaler.load_state_dict(checkpoint["scaler"])
-        except Exception as e:
-            print(f"[resume] scaler state load failed: {e}")
-
-    # book-keeping
-    start_epoch = int(checkpoint.get("epoch", 0))
-    global_step = int(checkpoint.get("global_step", 0))
-
-    # RNG
-    if "rng_state" in checkpoint:
-        try:
-            torch.set_rng_state(checkpoint["rng_state"])
-        except Exception:
-            pass
-    if "cuda_rng_state" in checkpoint and torch.cuda.is_available():
-        try:
-            torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state"])
-        except Exception:
-            pass
-    if "numpy_rng_state" in checkpoint:
-        try:
-            np.random.set_state(checkpoint["numpy_rng_state"])
-        except Exception:
-            pass
-    if "python_random_state" in checkpoint:
-        try:
-            random.setstate(checkpoint["python_random_state"])
-        except Exception:
-            pass
-
-    print(f"[resume] Resumed at epoch={start_epoch}, global_step={global_step}")
-    return start_epoch, global_step

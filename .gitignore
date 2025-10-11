@@ -3,4 +3,6 @@ checkpoints_*
 __pycache__/
 worktable.ipynb
 drafts/
-results/
+temp/
+
+*.ckpt

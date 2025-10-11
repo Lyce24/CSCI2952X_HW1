@@ -16,14 +16,23 @@ STD  = [0.1225, 0.1134, 0.1062] # calculated based on dataset with the black bac
 FG_MEAN = [0.5563723577581228, 0.5466399687071238, 0.5065107300061998] # calculated based on dataset using otsu thresholding
 FG_STD  = [0.20517936480092377, 0.1763141906401364, 0.16977451864162768] # calculated based on dataset using otsu thresholding
 
+IN_MEAN = [0.485, 0.456, 0.406]  # ImageNet mean
+IN_STD  = [0.229, 0.224, 0.225] # ImageNet std
+
 ga_normalize = transforms.Normalize(mean=MEAN,
                                     std=STD)  # calculated based on dataset
 
 gafg_normalize = transforms.Normalize(mean=FG_MEAN,
                                     std=FG_STD)  # calculated based on dataset
 
-in_normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
+in_normalize = transforms.Normalize(mean=IN_MEAN,
+                                     std=IN_STD)
+
+def collate_moco(batch):
+    x1 = torch.stack([b["x1"] for b in batch])
+    x2 = torch.stack([b["x2"] for b in batch])
+    original_images = torch.stack([b["ori_image"] for b in batch])
+    return [x1, x2], original_images
 
 def collate_fn(batch): 
     x = torch.stack([b["image"] for b in batch]) 
@@ -158,18 +167,14 @@ def build_galaxy_aware_transforms(
 
     return strong_pipeline, weak_pipeline
 
-def collate_moco(batch):
-    x1 = torch.stack([b["x1"] for b in batch])
-    x2 = torch.stack([b["x2"] for b in batch])
-    original_images = torch.stack([b["ori_image"] for b in batch])
-    return [x1, x2], original_images
-
 def get_ssl_dataloader(batch_size, 
                        workers,
                        da_method = "BYOL",
                        crop_min = 0.5,
                        flips = True,
                        rotations = True,
+                       artifacts = True,
+                       noise = True,
                        normalization = "IN",
                        seed = 2952):
 
@@ -192,6 +197,8 @@ def get_ssl_dataloader(batch_size,
             img_size=224,
             flips=flips,
             rotations=rotations,
+            artifacts=artifacts,
+            noise=noise,
             normalization=normalization
         )
     else:
@@ -235,6 +242,7 @@ def get_ssl_dataloader(batch_size,
         collate_fn=collate_moco
     )
 
+# ONLY FOR VISUALIZATION PURPOSES
 def get_ssl_test_dataloader(batch_size, workers, normalization = "IN", seed = 2952):
 
     if normalization.upper() == "IN":

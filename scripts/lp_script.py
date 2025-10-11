@@ -44,11 +44,19 @@ def construct_backbone(arch: str,
         model.load_state_dict(ckpt["state_dict"], strict=True)
         model.to(device)
         feature_extractor = model.base_encoder
+        
+        for param in feature_extractor.parameters():
+            param.requires_grad = False  # Freeze backbone
+        
         return feature_extractor
     elif model_weights is not None:
         model.load_state_dict(model_weights, strict=True)
         model.to(device)
         feature_extractor = model.base_encoder
+
+        for param in feature_extractor.parameters():
+            param.requires_grad = False  # Freeze backbone
+
         return feature_extractor
     else:
         print("No checkpoint path provided, returning randomly initialized model.")
@@ -82,7 +90,41 @@ def add_weight_decay_exclusions(model: nn.Module, weight_decay: float, lr: float
         {"params": decay, "weight_decay": weight_decay, "lr": lr},
         {"params": no_decay, "weight_decay": 0.0, "lr": lr},
     ]  
-  
+
+def make_optimizer(model: nn.Module,
+                   lr: float,
+                   wd: float,
+                   opt: str = "adamw",
+                   momentum: float = 0.9,
+                   backbone_lr: float | None = None,
+                   backbone_wd: float | None = None):
+    if (backbone_lr is not None) and (backbone_wd is not None):
+        param_groups = (
+            add_weight_decay_exclusions(model.backbone, backbone_wd, backbone_lr) +
+            add_weight_decay_exclusions(model.fc,       wd,          lr)
+        )
+    else:
+        param_groups = add_weight_decay_exclusions(model, weight_decay=wd, lr=lr)
+
+    opt = opt.lower()
+    if opt == "sgd":
+        return optim.SGD(param_groups, lr=lr, momentum=momentum, nesterov=True)
+    elif opt == "adamw":
+        return optim.AdamW(param_groups, betas=(0.9, 0.999))
+    else:
+        raise ValueError(f"Unknown optimizer: {opt}")
+
+def make_warmup_cosine_scheduler(optimizer, steps_per_epoch, epochs, warmup_epochs=10, eta_min=1e-6):
+    total_steps  = max(1, steps_per_epoch * epochs)
+    warmup_steps = max(0, steps_per_epoch * warmup_epochs)
+    if warmup_steps == 0:
+        return optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=eta_min)
+
+    warmup = optim.lr_scheduler.LinearLR(optimizer, start_factor=1e-3, end_factor=1.0, total_iters=warmup_steps)
+    cosine = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps, eta_min=eta_min)
+    return optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps])
+
+
 # ----------------------------
 #   TRAIN / VAL EPOCHS
 # ----------------------------
@@ -93,14 +135,12 @@ def train_one_epoch(model,
                     device,
                     scheduler=None,
                     scaler: torch.amp.GradScaler | None = None,
+                    use_amp: bool = True,
+                    amp_dtype=torch.float16,
                     grad_clip_norm: float | None = None):
     model.train()
     running_loss, n = 0.0, 0
-
-    use_amp = (scaler is not None)
-    if use_amp:
-        amp_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
-
+    
     for images, labels in loader:
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
@@ -155,130 +195,6 @@ def validate(model, loader, criterion, device):
         n += bs
 
     return total_loss / max(n, 1), total_acc / max(n, 1)
-
-def train_classifier(epochs, 
-                     model, 
-                     train_loader, 
-                     val_loader,
-                     lr, 
-                     wd,
-                     device, 
-                     out_dir=None,
-                     use_amp=True,
-                     backbone_lr=None,
-                     backbone_wd=None,
-                     label_smoothing: float = 0.05,
-                     print_freq=10,
-                     grad_clip_norm: float | None = None,
-                     eta_min: float = 1e-6):
-
-    model.to(device)
-
-    # ---- Loss ----
-    criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
-
-    # ---- Optimizer (supports separate backbone head lrs/wds) ----
-    if backbone_lr is not None and backbone_wd is not None:
-        params = (
-            add_weight_decay_exclusions(model.backbone, backbone_wd, backbone_lr)
-            + add_weight_decay_exclusions(model.fc, wd, lr)
-        )
-        optimizer = optim.AdamW(params, betas=(0.9, 0.999))
-    else:
-        param_groups = add_weight_decay_exclusions(model, weight_decay=wd, lr=lr)
-        optimizer = optim.AdamW(param_groups, betas=(0.9, 0.999))
-
-    # ---- AMP scaler ----
-    scaler = torch.amp.GradScaler() if (use_amp and device.type == "cuda") else None
-
-    # ---- LR schedule: cosine per-iteration ----
-    steps_per_epoch = len(train_loader)
-    total_steps = max(1, epochs * steps_per_epoch)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=eta_min)
-
-    # ---- I/O ----
-    logger = None
-    best_path = None
-    best_weights = None
-    if out_dir is not None:
-        out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
-        log_path = out / "train_log.csv"
-        logger = CSVLogger(
-            str(log_path),
-            fieldnames=["phase", "epoch", "lr", "loss", "acc", "time_sec"]
-        )
-        best_path = out / "best.ckpt"
-
-    # ---- Early stopping ----
-    patience = max(1, int(0.2 * epochs))  # ~20% of total epochs
-    best_val_acc = -1.0
-    best_epoch = -1
-    epochs_since_improve = 0
-
-    # ---- Train loop ----
-    for epoch in range(1, epochs + 1):
-        t0 = time.time()
-        train_loss = train_one_epoch(
-            model=model,
-            loader=train_loader,
-            optimizer=optimizer,
-            criterion=criterion,
-            device=device,
-            scheduler=scheduler,   # step inside train_one_epoch per iteration
-            scaler=scaler,
-            grad_clip_norm=grad_clip_norm
-        )
-        t1 = time.time()
-
-        val_loss, val_acc = validate(model, val_loader, criterion, device)
-        t2 = time.time()
-
-        # current LR (read from the first param group)
-        lr_now = optimizer.param_groups[0]["lr"]
-
-        # logging
-        if logger is not None:
-            logger.log({"phase":"train_epoch","epoch":epoch,"lr":f"{lr_now:.8f}",
-                        "loss":f"{train_loss:.6f}","acc":"","time_sec":f"{t1 - t0:.3f}"})
-            logger.log({"phase":"val_epoch","epoch":epoch,"lr":f"{lr_now:.8f}",
-                        "loss":f"{val_loss:.6f}","acc":f"{val_acc:.6f}","time_sec":f"{t2 - t1:.3f}"})
-
-        if epoch % print_freq == 0 or epoch == 1 or epoch == epochs:
-            print(f"Epoch {epoch:03d}/{epochs} | "
-                  f"lr {lr_now:.2e} | "
-                  f"train_loss {train_loss:.4f} | "
-                  f"val_loss {val_loss:.4f} | "
-                  f"val_acc {val_acc*100:.2f}% | "
-                  f"{t1 - t0:.1f}s/{t2 - t1:.1f}s (train/val)")
-
-        # best/early-stopping
-        improved = val_acc > best_val_acc
-        if improved:
-            best_val_acc = val_acc
-            best_epoch = epoch
-            epochs_since_improve = 0
-            best_weights = copy.deepcopy(model.state_dict())
-        else:
-            epochs_since_improve += 1
-
-        if epochs_since_improve >= patience:
-            print(f"Early stopping at epoch {epoch} (no improvement for {patience} epochs). "
-                  f"Best @ epoch {best_epoch} with val_acc {best_val_acc*100:.2f}%")
-            break
-
-    # ---- save best weights ----
-    if (best_path is not None) and (best_weights is not None):
-        torch.save({
-            "model": best_weights,
-            "best_epoch": best_epoch,
-            "best_val_acc": best_val_acc,
-        }, best_path)
-
-
-    print(f"Done. Best val_acc: {best_val_acc*100:.2f}% at epoch {best_epoch}. "
-          f"Saved best -> {best_path if best_path is not None else 'N/A'}")
-    
-    return best_weights, best_val_acc, best_epoch
 
 # Report ACC, PREC, RECALL, F1, AUROC (for multi-class), confusion matrix
 @torch.no_grad()
@@ -366,6 +282,143 @@ def final_evaluation(model,
 
     return metrics, y_true, y_pred, y_prob
 
+
+def train_classifier(epochs, 
+                     model, 
+                     train_loader, 
+                     val_loader,
+                     lr, 
+                     wd,
+                     device, 
+                     opt = "adamw",
+                     out_dir=None,
+                     use_amp=True,
+                     backbone_lr=None,
+                     backbone_wd=None,
+                     label_smoothing: float = 0.05,
+                     print_freq=10,
+                     grad_clip_norm: float | None = None,
+                     warmup_epochs: int = 0,
+                     eta_min: float = 1e-6):
+
+    model.to(device)
+
+    # ---- Loss ----
+    criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+
+    # ---- Optimizer (supports separate backbone head lrs/wds) ----
+    optimizer = make_optimizer(model=model,
+                               lr=lr,
+                               wd=wd,
+                               opt=opt,
+                               momentum=0.9,
+                               backbone_lr=backbone_lr,
+                               backbone_wd=backbone_wd)
+
+    # ---- AMP scaler ----
+    scaler = torch.amp.GradScaler() if (use_amp and device.type == "cuda") else None
+
+    # ---- LR schedule: cosine per-iteration ----
+    steps_per_epoch = len(train_loader)
+    scheduler = make_warmup_cosine_scheduler(
+        optimizer=optimizer,
+        steps_per_epoch=steps_per_epoch,
+        epochs=epochs,
+        warmup_epochs=warmup_epochs,
+        eta_min=eta_min
+    )
+
+    # ---- I/O ----
+    logger = None
+    best_path = None
+    best_weights = None
+    if out_dir is not None:
+        out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
+        log_path = out / "train_log.csv"
+        logger = CSVLogger(
+            str(log_path),
+            fieldnames=["phase", "epoch", "lr", "loss", "acc", "time_sec"]
+        )
+        best_path = out / "best.ckpt"
+
+    # ---- Early stopping ----
+    patience = max(1, int(0.2 * epochs))  # ~20% of total epochs
+    best_val_acc = -1.0
+    best_epoch = -1
+    epochs_since_improve = 0
+
+    # ---- AMP dtype ----
+    if use_amp:
+        amp_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+
+    # ---- Train loop ----
+    for epoch in range(1, epochs + 1):
+        t0 = time.time()
+        train_loss = train_one_epoch(
+            model=model,
+            loader=train_loader,
+            optimizer=optimizer,
+            criterion=criterion,
+            device=device,
+            scheduler=scheduler,   # step inside train_one_epoch per iteration
+            scaler=scaler,
+            use_amp=use_amp,
+            amp_dtype=amp_dtype if use_amp else None,
+            grad_clip_norm=grad_clip_norm
+        )
+        t1 = time.time()
+
+        val_loss, val_acc = validate(model, val_loader, criterion, device)
+        t2 = time.time()
+
+        # current LR (read from the first param group)
+        lr_now = optimizer.param_groups[0]["lr"]
+
+        # logging
+        if logger is not None:
+            logger.log({"phase":"train_epoch","epoch":epoch,"lr":f"{lr_now:.8f}",
+                        "loss":f"{train_loss:.6f}","acc":"","time_sec":f"{t1 - t0:.3f}"})
+            logger.log({"phase":"val_epoch","epoch":epoch,"lr":f"{lr_now:.8f}",
+                        "loss":f"{val_loss:.6f}","acc":f"{val_acc:.6f}","time_sec":f"{t2 - t1:.3f}"})
+
+        if epoch % print_freq == 0 or epoch == 1 or epoch == epochs:
+            print(f"Epoch {epoch:03d}/{epochs} | "
+                  f"lr {lr_now:.2e} | "
+                  f"train_loss {train_loss:.4f} | "
+                  f"val_loss {val_loss:.4f} | "
+                  f"val_acc {val_acc*100:.2f}% | "
+                  f"{t1 - t0:.1f}s/{t2 - t1:.1f}s (train/val)")
+
+        # best/early-stopping
+        improved = val_acc > best_val_acc
+        if improved:
+            best_val_acc = val_acc
+            best_epoch = epoch
+            epochs_since_improve = 0
+            best_weights = copy.deepcopy(model.state_dict())
+        else:
+            epochs_since_improve += 1
+
+        if epochs_since_improve >= patience:
+            print(f"Early stopping at epoch {epoch} (no improvement for {patience} epochs). "
+                  f"Best @ epoch {best_epoch} with val_acc {best_val_acc*100:.2f}%")
+            break
+
+    # ---- save best weights ----
+    if (best_path is not None) and (best_weights is not None):
+        torch.save({
+            "model": best_weights,
+            "best_epoch": best_epoch,
+            "best_val_acc": best_val_acc,
+        }, best_path)
+
+    print(f"Done. Best val_acc: {best_val_acc*100:.2f}% at epoch {best_epoch}. "
+          f"Saved best -> {best_path if best_path is not None else 'N/A'}")
+    
+    return best_weights, best_val_acc, best_epoch
+
+# ----------------------------
+#   TESTING
 @torch.no_grad()
 def test(model, test_loader, device, ckpt_path=None, model_weights=None, out_dir=None):
     """

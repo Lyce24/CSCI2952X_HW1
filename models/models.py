@@ -1,5 +1,4 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
-# All rights reserved.
+# Based On MoCo V3 Paper: https://arxiv.org/abs/2104.02057
 
 import torch
 import torch.nn as nn
@@ -8,6 +7,7 @@ import timm
 
 import math, torch, torch.nn as nn
 
+# Originally from https://github.com/facebookresearch/moco-v3
 @torch.no_grad()
 def build_2d_sincos_pos_embed(grid_size, embed_dim, temperature=10000.):
     h, w = grid_size
@@ -71,7 +71,7 @@ def moco_vit_init(model: nn.Module):
 # -------------------------
 # Encoder factory (no pretrained weights)
 # -------------------------
-def build_encoder(arch: str, moco_style: bool = True):
+def build_encoder(arch: str, moco_style: bool = False):
     """
     Returns (model, is_vit).
     - torchvision ResNets: 'resnet18', 'resnet34', 'resnet50', 'resnet101', ...
@@ -236,7 +236,7 @@ class MoCo(nn.Module):
 
         return self.contrastive_loss(q1, k2) + self.contrastive_loss(q2, k1)
 
-
+################################### Classifier for Linear Probing #############################
 class Classifier(nn.Module):
     def __init__(self, backbone, num_classes=10, requires_grad=False, eval_mode=True, moco_style: bool = False):
         super(Classifier, self).__init__()

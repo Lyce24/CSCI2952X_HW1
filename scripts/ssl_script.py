@@ -1,120 +1,185 @@
-from utils.utils import LARS, CSVLogger
+from utils.utils import LARS, CSVLogger, save_checkpoint
 import torch.optim as optim
-import math
 import torch
-import shutil
+import torch.nn as nn
+import math
 import time
 import os
 from torch.amp import GradScaler, autocast
 
-def adjust_learning_rate(optimizer, epoch, lr, warmup_epochs, epochs):
-    """Decays the learning rate with half-cycle cosine after warmup"""
-    if epoch < warmup_epochs:
-        lr = lr * epoch / warmup_epochs
-    else:
-        lr = lr * 0.5 * (1. + math.cos(math.pi * (epoch - warmup_epochs) / (epochs - warmup_epochs)))
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-    return lr
+# -------------------------
+# Schedules (step-aware)
+# -------------------------
+def cosine_with_warmup_step(base_lr: float, step: int, total_steps: int, warmup_steps: int) -> float:
+    """
+    Per-step cosine LR with linear warmup in steps.
+    """
+    step = min(step, total_steps)
+    if warmup_steps > 0 and step < warmup_steps:
+        return base_lr * float(step) / float(max(1, warmup_steps))
+    # cosine from 1.0 -> 0.0 over [warmup_steps, total_steps]
+    progress = (step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+    return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
 
-def adjust_moco_momentum(epoch, moco_m, epochs):
-    """Adjust moco momentum based on current epoch"""
-    m = 1. - 0.5 * (1. + math.cos(math.pi * epoch / epochs)) * (1. - moco_m)
-    return m
-    
-def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
-    torch.save(state, filename)
-    if is_best:
-        shutil.copyfile(filename, 'model_best.pth.tar')
-        
+def cosine_momentum_099_to_1(step: int, total_steps: int, m_start: float = 0.99) -> float:
+    """
+    Cosine ramp of momentum from m_start -> 1.0 over total_steps.
+    """
+    step = min(step, total_steps)
+    progress = step / float(max(1, total_steps))
+    # m = 1 - (1-m_start)*0.5*(1+cos(pi * progress))
+    return 1.0 - (1.0 - m_start) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+# -------------------------
+# Optimizer helpers
+# -------------------------
+def add_weight_decay_exclusions(model: nn.Module, weight_decay: float):
+    """
+    Create AdamW param groups with no weight decay for bias and norm parameters.
+    Heuristic: no-decay for 1D params (e.g., LN/Bias), and names containing 'bias' or 'norm'.
+    """
+    decay, no_decay = [], []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if param.ndim == 1 or name.endswith(".bias") or "norm" in name.lower() or "ln" in name.lower() or "layernorm" in name.lower():
+            no_decay.append(param)
+        else:
+            decay.append(param)
+    return [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+
 def train_one_epoch(
     model,
     train_loader,
-    lr,
-    warmup_epochs,
-    epochs,
-    moco_m,
+    base_lr,
+    moco_m,             
     moco_m_cos,
     optimizer,
     scaler,
     epoch,
     device,
     print_freq,
-    logger: CSVLogger
-):    
+    logger: CSVLogger,
+    total_steps: int,
+    warmup_steps: int,
+    global_step: int,
+    max_grad_norm: float = 3.0,
+    amp_dtype=torch.float16,
+    iters_per_epoch=None,
+):
     # switch to train mode
     model.train()
-    iters_per_epoch = len(train_loader)    
     end = time.perf_counter()
-    
-    losses = 0.0
+
+    running_loss = 0.0
     epoch_time = 0.0
 
     optimizer.zero_grad(set_to_none=True)
+
     for i, (images, _) in enumerate(train_loader):        
-        # ------------------- load + H2D -------------------
+        # ------------------- H2D -------------------
         x1 = images[0].to(device, non_blocking=True)
         x2 = images[1].to(device, non_blocking=True)
-        
-        # if i == 0:
-        #     # check the shape of the first batch
-        #     print("Batch shape:", x1.shape, x2.shape)
+        batch_size = x1.size(0)  # number of original images
 
-        lr_now = adjust_learning_rate(optimizer, epoch + i / iters_per_epoch, lr, warmup_epochs, epochs)
-        m = adjust_moco_momentum(epoch + i / iters_per_epoch,
-                                moco_m, epochs) if moco_m_cos else moco_m
+        # ------------------- per-step schedules -------------------
+        lr_now = cosine_with_warmup_step(base_lr, global_step, total_steps, warmup_steps)
+        for pg in optimizer.param_groups:
+            pg["lr"] = lr_now
+
+        if moco_m_cos:
+            m = cosine_momentum_099_to_1(global_step, total_steps, m_start=0.99)
+        else:
+            m = moco_m
 
         # ------------------- forward/backward -------------------
-        with autocast(device_type=device.type, dtype=torch.float16):
+        with autocast(device_type=device.type, dtype=amp_dtype):
             loss = model(x1, x2, m=m)
 
         # compute gradient and do SGD step
         scaler.scale(loss).backward()
+        
+        # Clip only if needed
+        if max_grad_norm and max_grad_norm > 0:
+            scaler.unscale_(optimizer)
+            # quick check
+            total_norm = torch.norm(torch.stack([p.grad.norm(p=2) for p in model.parameters() if p.grad is not None]), p=2)
+            if total_norm > max_grad_norm:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
-
+        
         # ------------------- timing/logging -------------------
         t_iter_end = time.perf_counter()
-        step_time = t_iter_end - end # in the unit of second
+        step_time = t_iter_end - end
         end = t_iter_end
-        
+
         epoch_time += step_time
-        loss_f = loss.detach().float().item()
-        losses += loss_f
+        loss_f = float(loss.detach())
+        running_loss += loss_f
+
+        # per-image timing/throughput
+        time_per_image = step_time / max(1, batch_size)
+        imgs_per_sec = batch_size / max(1e-12, step_time)
 
         if (i + 1) % print_freq == 0:
-            print(f'Epoch: [{epoch}][{i+1}/{iters_per_epoch}]\t'
-                  f'Time {step_time:.3f}\t'
-                  f'LR {lr_now:.6f}\t'
-                  f'Loss {loss_f:.4f}')
-            
-            logger.log({
-                "phase": "train_iter",
-                "epoch": epoch,
-                "iter": i + 1,
-                "iters_per_epoch": iters_per_epoch,
-                "lr": f"{lr_now:.8f}",
-                "moco_m": f"{m:.6f}",
-                "loss": f"{loss_f:.6f}",
-                "step_time_sec": f"{step_time:.6f}",
-            })
-            
-    avg_time = epoch_time / iters_per_epoch
-    avg_loss = losses / iters_per_epoch
-    print(f' * Epoch: [{epoch}] Average Loss {avg_loss:.4f}\tAverage Time {avg_time:.3f}')
-    # -------- CSV epoch summary --------
-    logger.log({
-        "phase": "epoch_summary",
-        "epoch": epoch,
-        "iter": iters_per_epoch,
-        "iters_per_epoch": iters_per_epoch,
-        "lr": f"{lr_now:.8f}",
-        "moco_m": f"{m:.6f}",
-        "loss": f"{avg_loss:.6f}",
-        "step_time_sec": f"{avg_time:.6f}",
-    })
+            print(
+                f'Epoch: [{epoch}][{i+1}/{iters_per_epoch}] '
+                f'Time {step_time:.3f}s  '
+                f'LR {lr_now:.6e}  '
+                f'm {m:.6f}  '
+                f'Loss {loss_f:.4f}  '
+                f't/img {time_per_image*1e3:.2f}ms  '
+                f'img/s {imgs_per_sec:.1f}'
+            )
+            if logger is not None:
+                logger.log({
+                    "phase": "train_iter",
+                    "epoch": epoch,
+                    "iter": i + 1,
+                    "iters_per_epoch": iters_per_epoch,
+                    "lr": f"{lr_now:.8e}",
+                    "moco_m": f"{m:.6f}",
+                    "loss": f"{loss_f:.6f}",
+                    "step_time_sec": f"{step_time:.6f}",
+                    "time_per_image_sec": f"{time_per_image:.8f}",
+                    "images_per_sec": f"{imgs_per_sec:.2f}",
+                    "global_step": global_step,
+                })
 
+        global_step += 1
+
+    avg_time = epoch_time / max(1, iters_per_epoch)
+    avg_loss = running_loss / max(1, iters_per_epoch)
+    print(f' * Epoch [{epoch}]  Avg Loss {avg_loss:.4f}  Avg Step {avg_time:.3f}s')
+
+    # epoch summary
+    if logger is not None:
+        logger.log({
+            "phase": "epoch_summary",
+            "epoch": epoch,
+            "iter": iters_per_epoch,
+            "iters_per_epoch": iters_per_epoch,
+            "lr": f"{lr_now:.8e}",
+            "moco_m": f"{m:.6f}",
+            "loss": f"{avg_loss:.6f}",
+            "step_time_sec": f"{avg_time:.6f}",
+            "time_per_image_sec": f"{(avg_time / max(1, batch_size)):.8f}",
+            "images_per_sec": f"{(batch_size / max(1e-12, avg_time)):.2f}",
+            "global_step": global_step,
+        })
+        
+    # loss
+    return global_step, avg_loss
+
+# -------------------------
+# Top-level train
+# -------------------------
 def train_moco(
     model,
     train_loader,
@@ -127,53 +192,78 @@ def train_moco(
     momentum,
     optimizer,
     device,
-    ckpt_dir,
+    ckpt_dir=None,
     print_freq=10,
     save_freq=50,
+    max_grad_norm: float = 3.0,
 ):
     model.to(device)
     use_amp = (device.type == 'cuda')
+    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
     scaler = GradScaler(enabled=use_amp)
 
     if optimizer == 'lars':
-        optimizer = LARS(model.parameters(), lr,
-                                        weight_decay=wd,
-                                        momentum=momentum)
+        opt = LARS(model.parameters(), lr, weight_decay=wd, momentum=momentum)
     elif optimizer == 'adamw':
-        optimizer = optim.AdamW(model.parameters(), lr,
-                                weight_decay=wd)
+        param_groups = add_weight_decay_exclusions(model, weight_decay=wd)
+        opt = optim.AdamW(param_groups, lr=lr)
+    else:
+        raise ValueError(f"Unknown optimizer: {optimizer}")
     
-    os.makedirs(ckpt_dir, exist_ok=True)
-    log_path = os.path.join(ckpt_dir, "train_log.csv")
-    logger = CSVLogger(
-        log_path,
-        fieldnames=[
-            "phase", "epoch", "iter", "iters_per_epoch",
-            "lr", "moco_m", "loss",
-            "step_time_sec"
-        ],
-    )
-
-    for epoch in range(0, epochs):
-        # train for one epoch
-        train_one_epoch(
-            model,
-            train_loader,
-            lr,
-            warmup_epochs,
-            epochs,
-            moco_m,
-            moco_m_cos,
-            optimizer,
-            scaler,
-            epoch,
-            device,
-            print_freq,
-            logger
+    # logging
+    logger = None
+    if ckpt_dir is not None:
+        os.makedirs(ckpt_dir, exist_ok=True)
+        log_path = os.path.join(ckpt_dir, "train_log.csv")
+        logger = CSVLogger(
+            log_path,
+            fieldnames=[
+                "phase", "epoch", "iter", "iters_per_epoch",
+                "lr", "moco_m", "loss",
+                "step_time_sec", "time_per_image_sec", "images_per_sec",
+                "global_step"
+            ],
         )
 
-        # save per save_freq epochs
-        if (epoch + 1) % save_freq == 0 or (epoch + 1) == epochs:
-            save_checkpoint({
-                'state_dict': model.state_dict(),
-            }, is_best=False, filename=f'{ckpt_dir}/checkpoint_{epoch+1:04d}.pth.tar')    
+    # step accounting
+    iters_per_epoch = len(train_loader)
+    total_steps = epochs * iters_per_epoch
+    warmup_steps = int(warmup_epochs * iters_per_epoch)
+    global_step = 0
+
+    # training loop
+    for epoch in range(0, epochs):
+        # train for one epoch
+        global_step, avg_loss = train_one_epoch(
+            model=model,
+            train_loader=train_loader,
+            base_lr=lr,
+            moco_m=moco_m,
+            moco_m_cos=moco_m_cos,
+            optimizer=opt,
+            scaler=scaler,
+            epoch=epoch,
+            device=device,
+            print_freq=print_freq,
+            logger=logger,
+            total_steps=total_steps,
+            warmup_steps=warmup_steps,
+            global_step=global_step,
+            max_grad_norm=max_grad_norm,
+            amp_dtype=amp_dtype,
+            iters_per_epoch=iters_per_epoch,
+        )
+        
+        # periodic & final checkpoint
+        if ckpt_dir is None:
+            continue
+        
+        if ((epoch + 1) % save_freq == 0) or ((epoch + 1) == epochs):
+            ckpt_path = f'{ckpt_dir}/checkpoint_{epoch+1:04d}.pth.tar'
+            state = {
+                "state_dict": model.state_dict(),
+            }
+            save_checkpoint(state, is_best=False, filename=ckpt_path)
+        
+    return model.state_dict(), avg_loss # return final model weights and loss

@@ -2,7 +2,7 @@ import time
 
 from data.data import get_ssl_dataloader
 from models.models import MoCo
-from scripts.ssl_script_test import train_moco
+from scripts.ssl_script import train_moco
 
 from data.data import get_lp_dataloaders
 from utils.utils import set_seed, CSVLogger
@@ -35,6 +35,8 @@ def run_once(config: dict):
         crop_min=config["ssl_crop_min"],
         flips=config["ssl_flips"],
         rotations=config["ssl_rotations"],
+        artifacts=config["ssl_artifacts"],
+        noise=config["ssl_noise"],
         normalization=config["ssl_normalization"],
         seed=config["seed"],
     )
@@ -52,6 +54,20 @@ def run_once(config: dict):
 
     print(f"=> creating MoCo model '{config['arch']}'")
 
+    ckpt_dir = (
+        f"./checkpoints/exp/checkpoints_{config['arch']}_"
+        f"{config['ssl_lr']}_"
+        f"{config['ssl_wd']}_"
+        f"{config['ssl_epochs']}_"
+        f"{config['ssl_da_method']}_"
+        f"{config['ssl_normalization']}_"
+        f"{config['ssl_flips']}_"
+        f"{config['ssl_rotations']}_"
+        f"{config['ssl_artifacts']}_"
+        f"{config['ssl_noise']}_"
+        f"{config['ssl_crop_min']}"
+    )
+
     print("Starting SSL training...")
     moco_weights, ssl_loss = train_moco(
         model=moco_model,
@@ -65,7 +81,7 @@ def run_once(config: dict):
         momentum=float(config["ssl_momentum"]),
         optimizer=str(config["ssl_optimizer"]),
         device=device,
-        ckpt_dir=None,
+        ckpt_dir=str(ckpt_dir),
         print_freq=int(config["ssl_print_freq"]),
         save_freq=int(config["ssl_save_freq"]),
     )
@@ -109,6 +125,24 @@ def run_once(config: dict):
     print(f"=> creating classifier on backbone '{config['arch']}'")
 
     print("Starting LP training...")
+    
+    out_dir = (
+        f"./results/exp/{config['arch']}_"
+        f"{config['ssl_lr']}_"
+        f"{config['ssl_wd']}_"
+        f"{config['ssl_epochs']}_"
+        f"{config['ssl_da_method']}_"
+        f"{config['ssl_normalization']}_"
+        f"{config['ssl_flips']}_"
+        f"{config['ssl_rotations']}_"
+        f"{config['ssl_artifacts']}_"
+        f"{config['ssl_noise']}_"
+        f"{config['ssl_crop_min']}_"
+        f"{config['lp_lr']}_"
+        f"{config['lp_wd']}_"
+        f"{config['lp_epochs']}"
+    )
+    
     classifier_weights, best_val_acc, best_epoch = train_classifier(
         epochs=int(config["lp_epochs"]),
         model=model,
@@ -117,14 +151,14 @@ def run_once(config: dict):
         lr=float(config["lp_lr"]),
         wd=float(config["lp_wd"]),
         device=device,
-        out_dir=None,
+        out_dir=out_dir,
         use_amp=True,
         label_smoothing=float(config["lp_label_smoothing"]),
         print_freq=int(config["lp_print_freq"]),
     )
 
-    test_loss, test_acc = test(
-        model, test_loader, device, ckpt_path=None, out_dir=None, model_weights=classifier_weights
+    test_loss, test_acc, _ = test(
+        model, test_loader, device, ckpt_path=None, model_weights=classifier_weights, out_dir=out_dir
     )
 
     lp_time = time.time() - lp_start
@@ -169,6 +203,8 @@ def run_multi_seed(base_config: dict, seeds: list[int], logger: CSVLogger = None
                 "ssl_normalization": cfg["ssl_normalization"],
                 "ssl_flips": cfg["ssl_flips"],
                 "ssl_rotations": cfg["ssl_rotations"],
+                "ssl_artifacts": cfg["ssl_artifacts"],
+                "ssl_noise": cfg["ssl_noise"],
                 "ssl_crop_min": cfg["ssl_crop_min"],
                 "ssl_lr": cfg["ssl_lr"], "ssl_wd": cfg["ssl_wd"],
                 "ssl_loss": out["ssl_loss"],
@@ -202,13 +238,13 @@ def run_multi_seed(base_config: dict, seeds: list[int], logger: CSVLogger = None
     return per_seed, summary
 
 def main(base_config: dict, exp_pairs: list[tuple], seeds: list[int] = [2952]):
-    results_csv = "results/ssl_lp_sweep.csv"
-    summary_csv = "results/ssl_lp_summary.csv"
+    results_csv = "results/ssl_lp_sweep_ab.csv"
+    summary_csv = "results/ssl_lp_summary_ab.csv"
     Path("results").mkdir(parents=True, exist_ok=True)
 
     # per-seed rows
     seed_fields = [
-        "timestamp","seed", "ssl_da_method","ssl_normalization","ssl_flips","ssl_rotations",
+        "timestamp","seed", "ssl_da_method","ssl_normalization","ssl_flips","ssl_rotations", "ssl_artifacts","ssl_noise",
         "ssl_crop_min","ssl_lr","ssl_wd",
         "ssl_loss","lp_best_val_acc","lp_best_epoch","lp_test_acc","lp_test_loss",
         "seed","ssl_time_sec","lp_time_sec","total_time_sec"
@@ -217,7 +253,7 @@ def main(base_config: dict, exp_pairs: list[tuple], seeds: list[int] = [2952]):
 
     # aggregated rows
     summary_fields = [
-        "timestamp","ssl_da_method","ssl_normalization","ssl_flips","ssl_rotations",
+        "timestamp","ssl_da_method","ssl_normalization","ssl_flips","ssl_rotations", "ssl_artifacts","ssl_noise",
         "ssl_crop_min","ssl_lr","ssl_wd","seeds",
         "ssl_loss_mean","ssl_loss_std",
         "lp_best_val_acc_mean","lp_best_val_acc_std",
@@ -227,17 +263,18 @@ def main(base_config: dict, exp_pairs: list[tuple], seeds: list[int] = [2952]):
     ]
     summary_logger = CSVLogger(summary_csv, summary_fields, overwrite=False)
 
-    for (ssl_lr, ssl_wd, da_method, norm, flips, rotations, crop_min) in exp_pairs:
+    for (ssl_lr, ssl_wd, da_method, norm, flips, rotations, artifacts, noise, crop_min) in exp_pairs:
         cfg = deepcopy(base_config)
         cfg.update({
             "ssl_lr": ssl_lr, "ssl_wd": ssl_wd,
             "ssl_da_method": da_method, "ssl_normalization": norm,
             "ssl_flips": bool(flips), "ssl_rotations": bool(rotations),
+            "ssl_artifacts": bool(artifacts), "ssl_noise": bool(noise),
             "ssl_crop_min": float(crop_min),
         })
         print("="*80)
         print(f"DA={da_method} Norm={norm} LR={ssl_lr} WD={ssl_wd} "
-              f"flips={flips} rotations={rotations} crop_min={crop_min} | seeds={seeds}")
+              f"flips={flips} rotations={rotations} artifacts={artifacts} noise={noise} crop_min={crop_min} | seeds={seeds}")
         print("="*80)
 
         _, summary = run_multi_seed(cfg, seeds, logger=logger)
@@ -249,6 +286,8 @@ def main(base_config: dict, exp_pairs: list[tuple], seeds: list[int] = [2952]):
             "ssl_normalization": cfg["ssl_normalization"],
             "ssl_flips": cfg["ssl_flips"],
             "ssl_rotations": cfg["ssl_rotations"],
+            "ssl_artifacts": cfg["ssl_artifacts"],
+            "ssl_noise": cfg["ssl_noise"],
             "ssl_crop_min": cfg["ssl_crop_min"],
             "ssl_lr": cfg["ssl_lr"], "ssl_wd": cfg["ssl_wd"],
             "seeds": ";".join(map(str, seeds)),
@@ -257,21 +296,30 @@ def main(base_config: dict, exp_pairs: list[tuple], seeds: list[int] = [2952]):
     print(f"Saved per-seed to {results_csv} and summaries to {summary_csv}")
 
 if __name__ == "__main__":
-    # changing values
-    # 1. ssl_da_method: "BYOL" or "GA"
-    # 2. ssl_normalization: "IN" or "GA"
-    # 3. (ssl_lr, ssl_wd) pairs
-    
     EXP_PAIRS = [
-        # LR, WD, DA method, Normalization, random flips, random rotations, crop_min
-        (3e-4, 0.05, "GA",   "IN", True, True, 0.1),   # GA + IN
-        (3e-4, 0.05, "BYOL", "IN", True, True, 0.1),   # BYOL + IN
-        (5e-4, 0.05, "GA",   "IN", True, True, 0.2),   # GA + IN
-        (7e-4, 0.05, "GA",   "IN", True, True, 0.2),   # GA + IN
+        # Hyperparameter sweeps:
+        (1e-4, 0.05, "GA",    "IN", True, True, True, True, 0.2),
+        (3e-4, 0.05, "GA",    "IN", True, True, True, True, 0.2),
+        (5e-4, 0.05, "GA",    "IN", True, True, True, True, 0.2),
+        (7e-4, 0.10, "GA",    "IN", True, True, True, True, 0.2),
+        (1e-3, 0.10, "GA",    "IN", True, True, True, True, 0.2),
+        
+        # Baselines:
+        (5e-4, 0.05, "BYOL",  "IN", True, True, True, True, 0.2),  # no augmentations
+        
+        # Ablation of augmentations:
+        (5e-4, 0.05, "GA",   "IN", False, True, True, True, 0.2), 
+        (5e-4, 0.05, "GA",   "IN", True, False, True, True, 0.2),
+        (5e-4, 0.05, "GA",   "IN", True, True, False, True, 0.2),
+        (5e-4, 0.05, "GA",   "IN", True, True, True,  False, 0.2),
+        
+        # crop_min ablation
+        (5e-4, 0.05, "GA",    "IN", True, True, True, True, 0.4),
+        (5e-4, 0.05, "GA",    "IN", True, True, True, True, 0.6)        
     ]
 
+
     INVARIANTS_CONFIG = {
-        # Repro & system
         "workers": 32,
 
         # Architecture & MoCo params
@@ -288,7 +336,7 @@ if __name__ == "__main__":
         "ssl_momentum": 0.9,
         "ssl_epochs": 100,            # quick sweep; extend to 300 for confirmatory run
         "ssl_warmup_epochs": 10,
-        "ssl_print_freq": 10,
+        "ssl_print_freq": 20,
         "ssl_save_freq": 50,
 
         # Linear probing
